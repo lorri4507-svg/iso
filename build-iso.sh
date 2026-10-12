@@ -9,6 +9,7 @@
 #
 # Usage:
 #   ./build-iso.sh [--clean-base] [--clean-target] [--local] [--profile <name>] [--chroot]
+#                  [--no-sequoia] [--sequoia]
 #
 # Options:
 #   --clean-base    Delete the base Debian cache and download it from scratch.
@@ -24,6 +25,8 @@
 #                   or days ago), any run -- --chroot or plain -- reuses it as-is and
 #                   skips repo/package install straight to chroot or to packaging.
 #                   Pass --clean-target to force a fresh one.
+#   --no-sequoia    Skip the macOS-Sequoia-style feature add-on (on by default).
+#   --sequoia       Re-apply the Sequoia add-on to an already existing target rootfs.
 #
 # Safety:
 #   By default the script NEVER installs packages on the host machine. If host
@@ -47,6 +50,8 @@ WITH_NVIDIA=false
 PULSAR_VERSION=""
 PROFILE="pear"
 DROP_TO_CHROOT=false
+WITH_SEQUOIA=true
+FORCE_SEQUOIA=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -81,6 +86,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --chroot)
             DROP_TO_CHROOT=true
+            shift
+            ;;
+        --no-sequoia)
+            WITH_SEQUOIA=false
+            shift
+            ;;
+        --sequoia)
+            FORCE_SEQUOIA=true
             shift
             ;;
         *)
@@ -356,6 +369,193 @@ fi
 
 # Dynamic detection of chroot binary path
 CHROOT_BIN=$(command -v chroot || echo "/usr/sbin/chroot")
+
+# ==============================================================================
+# Sequoia add-on: macOS-Sequoia-style features for the KDE Plasma image
+# ==============================================================================
+# Runs in two steps so it can see the pearOS APT repo and not be overwritten by
+# the profile's own branding:
+#   sequoia_install_packages  -> just before profile_teardown_repo (repo still on)
+#   sequoia_configure         -> right after profile_customize (config wins)
+# Skip it entirely with --no-sequoia. Re-run it on an existing target rootfs with
+# --sequoia. Environment knobs:
+#   SEQ_ONLINE=0              don't fetch anything from GitHub (WhiteSur themes)
+#   SEQ_NATURAL_SCROLL=0      leave touchpad scroll direction / tap-to-click alone
+#   SEQ_PEAR_PKGS="a b c"     pearOS packages to try from the profile's repo
+# Own wallpapers: put images in profiles/<name>/wallpapers/ (Apple's Sequoia
+# wallpapers are copyrighted, so none are bundled or downloaded).
+SEQ_ONLINE="${SEQ_ONLINE:-1}"
+SEQ_NATURAL_SCROLL="${SEQ_NATURAL_SCROLL:-1}"
+SEQ_PEAR_PKGS="${SEQ_PEAR_PKGS:-pearos-appmenu pearos-dock pearos-keyring}"
+
+seq_log() { echo "[sequoia] $*"; }
+
+seq_chroot() {
+    $SUDO "$CHROOT_BIN" "$ROOTFS_TARGET" /usr/bin/env DEBIAN_FRONTEND=noninteractive "$@"
+}
+
+# Install packages one at a time so a package missing from this suite/repo
+# never aborts the whole build.
+seq_apt_try() {
+    local p rc=0
+    for p in "$@"; do
+        if seq_chroot apt-get install -y --no-install-recommends "$p" >/dev/null 2>&1; then
+            seq_log "  + $p"
+        else
+            seq_log "  - $p (not available, skipped)"
+            rc=1
+        fi
+    done
+    return $rc
+}
+
+seq_git_install() {   # seq_git_install <name> <git url> <install command run inside the clone>
+    seq_log "Fetching $1 from GitHub..."
+    seq_chroot /bin/bash -c "set -e; d=\$(mktemp -d); trap 'rm -rf \"\$d\"' EXIT; cd \"\$d\"; GIT_TERMINAL_PROMPT=0 git clone --depth 1 '$2' src; cd src; $3" >/dev/null 2>&1 \
+        || seq_log "  $1 failed (network or upstream change), skipped"
+}
+
+sequoia_install_packages() {
+    $WITH_SEQUOIA || return 0
+    seq_log "Installing Sequoia-style feature packages..."
+    seq_chroot apt-get update >/dev/null 2>&1 || seq_log "apt-get update failed (no network?)"
+
+    # Sequoia feature            -> open-source stand-in
+    seq_apt_try keepassxc || true                                   # Passwords app
+    seq_apt_try qalculate-qt || seq_apt_try qalculate-gtk || true   # Math Notes (closest match, not a clone)
+    seq_apt_try kdeconnect scrcpy || true                           # Phone link / notification mirroring / Android mirroring
+    seq_apt_try uxplay usbmuxd libimobiledevice-utils ifuse gvfs-backends || true  # iPhone Mirroring: AirPlay mirror + USB access
+    seq_apt_try warpinator || true                                  # AirDrop-style local file sharing
+    seq_apt_try gamemode || true                                    # Game Mode
+    seq_apt_try fonts-inter fonts-noto-color-emoji || true          # SF / Apple Color Emoji look-alikes (installed, not forced)
+    seq_apt_try libkf6config-bin spectacle || true                  # kwriteconfig6 for the config step; screenshot tool
+
+    # pearOS open-source components from the profile's own repo (no-op if already installed)
+    local p
+    for p in $SEQ_PEAR_PKGS; do seq_apt_try "$p" || true; done
+
+    if [ "$SEQ_ONLINE" = "1" ]; then
+        seq_apt_try git sassc ca-certificates libglib2.0-dev-bin || true
+        seq_git_install WhiteSur-gtk-theme  https://github.com/vinceliuice/WhiteSur-gtk-theme.git  "./install.sh -d /usr/share/themes"
+        seq_git_install WhiteSur-icon-theme https://github.com/vinceliuice/WhiteSur-icon-theme.git "./install.sh -d /usr/share/icons"
+        seq_git_install WhiteSur-kde        https://github.com/vinceliuice/WhiteSur-kde.git        "./install.sh"
+        seq_log "WhiteSur themes are installed and selectable in System Settings (not forced as default)."
+    fi
+}
+
+SEQ_KW=""
+SEQ_TARGETS=()
+
+# seq_kw <file> <group> <key> <value>   (writes into /etc/skel and every existing home)
+seq_kw() {
+    local t
+    for t in "${SEQ_TARGETS[@]}"; do
+        seq_chroot mkdir -p "$t/.config"
+        seq_chroot chown --reference="$t" "$t/.config" 2>/dev/null || true
+        seq_chroot "$SEQ_KW" --file "$t/.config/$1" --group "$2" --key "$3" "$4" || true
+        seq_chroot chown --reference="$t" "$t/.config/$1" 2>/dev/null || true
+    done
+}
+
+# seq_kw2 <file> <group> <subgroup> <key> <value>
+seq_kw2() {
+    local t
+    for t in "${SEQ_TARGETS[@]}"; do
+        seq_chroot mkdir -p "$t/.config"
+        seq_chroot chown --reference="$t" "$t/.config" 2>/dev/null || true
+        seq_chroot "$SEQ_KW" --file "$t/.config/$1" --group "$2" --group "$3" --key "$4" "$5" || true
+        seq_chroot chown --reference="$t" "$t/.config/$1" 2>/dev/null || true
+    done
+}
+
+sequoia_configure() {
+    $WITH_SEQUOIA || return 0
+    seq_log "Configuring Sequoia-style tiling, shortcuts and wallpaper..."
+
+    SEQ_KW="$(seq_chroot /bin/sh -c 'command -v kwriteconfig6 || ls /usr/lib/*/libexec/kf6/kwriteconfig6 2>/dev/null | head -n1' 2>/dev/null)" || SEQ_KW=""
+    SEQ_TARGETS=(/etc/skel)
+    local h
+    for h in "$ROOTFS_TARGET"/home/*; do
+        [ -d "$h" ] && SEQ_TARGETS+=("${h#"$ROOTFS_TARGET"}")
+    done || true
+
+    if [ -n "$SEQ_KW" ]; then
+        local TAB=$'\t'
+        # Window tiling: drag to a screen edge, Ctrl+Meta+Arrow for halves
+        # (existing Meta+Arrow keeps working), Ctrl+Meta+Shift+Arrow for quarters.
+        seq_kw kwinrc Windows ElectricBorderTiling true
+        seq_kw kwinrc Windows ElectricBorderMaximize true
+        seq_kw kglobalshortcutsrc kwin "Window Quick Tile Left"   "Meta+Left${TAB}Meta+Ctrl+Left,Meta+Left,Quick Tile Window to the Left"
+        seq_kw kglobalshortcutsrc kwin "Window Quick Tile Right"  "Meta+Right${TAB}Meta+Ctrl+Right,Meta+Right,Quick Tile Window to the Right"
+        seq_kw kglobalshortcutsrc kwin "Window Quick Tile Top"    "Meta+Up${TAB}Meta+Ctrl+Up,Meta+Up,Quick Tile Window to the Top"
+        seq_kw kglobalshortcutsrc kwin "Window Quick Tile Bottom" "Meta+Down${TAB}Meta+Ctrl+Down,Meta+Down,Quick Tile Window to the Bottom"
+        seq_kw kglobalshortcutsrc kwin "Window Quick Tile Top Left"     "Meta+Ctrl+Shift+Left,none,Quick Tile Window to the Top Left"
+        seq_kw kglobalshortcutsrc kwin "Window Quick Tile Top Right"    "Meta+Ctrl+Shift+Up,none,Quick Tile Window to the Top Right"
+        seq_kw kglobalshortcutsrc kwin "Window Quick Tile Bottom Right" "Meta+Ctrl+Shift+Right,none,Quick Tile Window to the Bottom Right"
+        seq_kw kglobalshortcutsrc kwin "Window Quick Tile Bottom Left"  "Meta+Ctrl+Shift+Down,none,Quick Tile Window to the Bottom Left"
+        seq_kw kglobalshortcutsrc kwin "Window Maximize" "Meta+PgUp${TAB}Meta+Ctrl+F,Meta+PgUp,Maximize Window"
+
+        # Mac-style extras (the original keys keep working)
+        seq_kw kglobalshortcutsrc kwin "Walk Through Windows of Current Application" "Alt+\`${TAB}Meta+\`,Alt+\`,Walk Through Windows of Current Application"
+        seq_kw kglobalshortcutsrc kwin "Kill Window"   "Ctrl+Alt+Esc${TAB}Meta+Alt+Esc,Ctrl+Alt+Esc,Kill Window"
+        seq_kw kglobalshortcutsrc ksmserver "Lock Session" "Meta+L${TAB}Ctrl+Meta+Q${TAB}Screensaver,Meta+L${TAB}Screensaver,Lock Session"
+        # Screenshots like Shift+Cmd+3 / 4 / 5
+        seq_kw2 kglobalshortcutsrc services org.kde.spectacle.desktop FullScreenScreenShot        "Shift+Print${TAB}Meta+Shift+3,Shift+Print,Capture Entire Desktop"
+        seq_kw2 kglobalshortcutsrc services org.kde.spectacle.desktop RectangularRegionScreenShot "Meta+Shift+Print${TAB}Meta+Shift+4,Meta+Shift+Print,Capture Rectangular Region"
+        seq_kw2 kglobalshortcutsrc services org.kde.spectacle.desktop _launch                     "Print${TAB}Meta+Shift+5,Print,Launch Spectacle"
+    else
+        seq_log "kwriteconfig6 not found (is Plasma installed?), tiling/shortcut config skipped."
+    fi
+
+    # macOS-style touchpad: natural scrolling + tap to click (Xorg/libinput; Wayland
+    # sessions use their own per-device settings in System Settings).
+    if [ "$SEQ_NATURAL_SCROLL" = "1" ]; then
+        $SUDO mkdir -p "$ROOTFS_TARGET/etc/X11/xorg.conf.d"
+        cat <<'EOF' | $SUDO tee "$ROOTFS_TARGET/etc/X11/xorg.conf.d/40-sequoia-touchpad.conf" > /dev/null
+Section "InputClass"
+    Identifier "Sequoia touchpad"
+    MatchIsTouchpad "on"
+    MatchDriver "libinput"
+    Option "NaturalScrolling" "true"
+    Option "Tapping" "on"
+    Option "ClickMethod" "clickfinger"
+EndSection
+EOF
+    fi
+
+    # Wallpapers supplied by you in profiles/<name>/wallpapers/
+    if compgen -G "$PROFILE_DIR/wallpapers/*" >/dev/null; then
+        local first
+        $SUDO mkdir -p "$ROOTFS_TARGET/usr/share/backgrounds/sequoia" \
+                       "$ROOTFS_TARGET/usr/local/bin" \
+                       "$ROOTFS_TARGET/etc/skel/.config/autostart"
+        $SUDO cp -a "$PROFILE_DIR"/wallpapers/* "$ROOTFS_TARGET/usr/share/backgrounds/sequoia/"
+        first="$(ls -1 "$ROOTFS_TARGET/usr/share/backgrounds/sequoia" | head -n1)"
+        cat <<EOF | $SUDO tee "$ROOTFS_TARGET/usr/local/bin/sequoia-wallpaper" > /dev/null
+#!/bin/sh
+flag="\$HOME/.config/.sequoia-wallpaper-set"
+[ -e "\$flag" ] && exit 0
+plasma-apply-wallpaperimage "/usr/share/backgrounds/sequoia/$first" && touch "\$flag"
+EOF
+        $SUDO chmod 0755 "$ROOTFS_TARGET/usr/local/bin/sequoia-wallpaper"
+        cat <<'EOF' | $SUDO tee "$ROOTFS_TARGET/etc/skel/.config/autostart/sequoia-wallpaper.desktop" > /dev/null
+[Desktop Entry]
+Type=Application
+Name=Sequoia wallpaper
+Exec=/usr/local/bin/sequoia-wallpaper
+X-KDE-autostart-phase=2
+EOF
+        for h in "$ROOTFS_TARGET"/home/*; do
+            [ -d "$h" ] || continue
+            $SUDO mkdir -p "$h/.config/autostart"
+            $SUDO cp "$ROOTFS_TARGET/etc/skel/.config/autostart/sequoia-wallpaper.desktop" "$h/.config/autostart/"
+            $SUDO chown -R --reference="$h" "$h/.config/autostart" 2>/dev/null || true
+        done
+    fi
+
+    seq_chroot apt-get clean >/dev/null 2>&1 || true
+    seq_log "Sequoia features done."
+}
 
 # Preventative cleanup function to ensure filesystems are unmounted on interruption
 cleanup() {
@@ -684,6 +884,8 @@ else
     "
 fi
 
+sequoia_install_packages || echo "[sequoia] package step reported problems, continuing"
+
 profile_teardown_repo
 
 # Dynamically adjust Calamares configuration inside chroot based on distribution and selected bootloader
@@ -762,6 +964,8 @@ EOF
 
 profile_customize
 
+sequoia_configure || echo "[sequoia] configure step reported problems, continuing"
+
 # ==============================================================================
 # PHASE 6: Final Tasks (Initramfs regeneration and cleanup)
 # ==============================================================================
@@ -774,6 +978,13 @@ $SUDO "$CHROOT_BIN" "$ROOTFS_TARGET" /bin/bash -c "
 echo "Chroot rootfs ready and correctly structured in: $ROOTFS_TARGET"
 
 fi # RESUME_TARGET (PHASE 5 / 5.5 / 6)
+
+# --sequoia on a reused rootfs: apply the add-on now (pearOS repo is already torn
+# down at this point, so only Debian packages and GitHub sources are fetched).
+if $RESUME_TARGET && $FORCE_SEQUOIA; then
+    sequoia_install_packages || echo "[sequoia] package step reported problems, continuing"
+    sequoia_configure || echo "[sequoia] configure step reported problems, continuing"
+fi
 
 if $DROP_TO_CHROOT; then
     echo "=============================================================================="
@@ -794,6 +1005,78 @@ if $DROP_TO_CHROOT; then
     echo "=============================================================================="
     exit 0
 fi
+
+# ==============================================================================
+# PHASE 6.5: Integrate pear-macos-style into the built desktop
+# Runs for fresh AND reused root filesystems.
+# The style itself is applied at desktop login, not on the build host.
+# ==============================================================================
+
+install_pear_macos_style() {
+    local source_script="$ISO_DIR/pear-macos-style.sh"
+    local target_script="$ROOTFS_TARGET/usr/local/bin/pear-macos-style"
+    local autostart_dir="$ROOTFS_TARGET/etc/xdg/autostart"
+    local applications_dir="$ROOTFS_TARGET/usr/share/applications"
+
+    echo "[pear-macos-style] Preparing desktop integration..."
+
+    if [ ! -f "$source_script" ]; then
+        echo "[pear-macos-style] ERROR: Missing $source_script"
+        echo "Place pear-macos-style.sh in the repository root."
+        return 1
+    fi
+
+    # Install into the ISO rootfs, never execute against the build host.
+    $SUDO install -D -m 0755 "$source_script" "$target_script"
+
+    # kdialog is needed for the graphical style selector.
+    seq_apt_try kdialog || \
+        echo "[pear-macos-style] WARNING: kdialog could not be installed."
+
+    # Apply the default style once for each user's own configuration.
+    $SUDO install -d -m 0755 "$autostart_dir"
+    $SUDO tee \
+        "$autostart_dir/pear-macos-style-first-login.desktop" \
+        >/dev/null <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=pearOS Desktop Appearance
+Comment=Apply the default macOS-inspired desktop appearance once
+Exec=/usr/local/bin/pear-macos-style apply sequoia --dark --accent blue --once
+Terminal=false
+NoDisplay=true
+X-KDE-autostart-phase=2
+EOF
+
+    # Add a launcher so users can change the appearance later.
+    $SUDO install -d -m 0755 "$applications_dir"
+    $SUDO tee "$applications_dir/pear-macos-style.desktop" \
+        >/dev/null <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=pearOS macOS Style
+Comment=Change desktop style, accent color, and window buttons
+Exec=/usr/local/bin/pear-macos-style gui
+Icon=preferences-desktop-theme
+Terminal=false
+Categories=Settings;DesktopSettings;
+EOF
+
+    $SUDO chmod 0644 \
+        "$autostart_dir/pear-macos-style-first-login.desktop" \
+        "$applications_dir/pear-macos-style.desktop"
+
+    echo "[pear-macos-style] Installed into target rootfs."
+}
+
+install_pear_macos_style || {
+    echo "[pear-macos-style] ERROR: Integration failed; stopping build."
+    exit 1
+}
+
+# ==============================================================================
+# End pear-macos-style integration
+# ==============================================================================
 
 # ==============================================================================
 # PHASE 7: Packaging and Live ISO Generation
